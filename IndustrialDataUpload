@@ -14,11 +14,23 @@ from PIL import Image, ImageDraw
 class PathPoolCopyApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("产线测试数据自动汇总客户端 v9.1 ")
+        self.root.title("产线测试数据自动汇总客户端 v9.2")
         self.root.geometry("720x680")
         self.root.resizable(False, False)
         
-        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+        # ==================== 【核心修复区】 ====================
+        # 判断当前是直接运行 .py 源码，还是运行打包后的 .exe
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的 exe，获取 exe 所在的真实物理目录
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # 如果是源码运行，获取 py 文件所在目录
+            application_path = os.path.dirname(os.path.abspath(__file__))
+            
+        # 将 ini 配置文件强制保存在 exe 的同级目录下
+        self.config_file = os.path.join(application_path, "config.ini")
+        # ========================================================
+        
         self.config = configparser.ConfigParser()
         
         self.line_var = tk.StringVar(value="线体名称")
@@ -291,8 +303,6 @@ class PathPoolCopyApp:
         btn_frame = ttk.Frame(main_frame, padding="5")
         btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
         tk.Button(btn_frame, text="⚡ 仅同步今日数据 (测试)", command=self.manual_sync, bg="#0284c7", fg="white", font=("微软雅黑", 11, "bold"), width=22).pack(side=tk.LEFT, padx=5, ipady=5)
-        
-        # 👇 就是这里被修复了，老老实实拆成了两行！
         self.start_btn = tk.Button(btn_frame, text="▶️ 开始后台自动运行", command=self.toggle_timer, bg="#16a34a", fg="white", font=("微软雅黑", 11, "bold"), width=26)
         self.start_btn.pack(side=tk.RIGHT, padx=5, ipady=5)
 
