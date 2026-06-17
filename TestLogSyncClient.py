@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+产线测试数据自动汇总客户端 v10.1
+===============================
+后台静默运行，每日定时将产线测试数据增量同步到内网服务器。
+递归穿透所有子目录，按日期+大小智能增量合并。
+"""
+
 import os
 import sys
 import shutil
@@ -11,45 +20,57 @@ from tkinter import filedialog, messagebox, ttk
 import pystray
 from PIL import Image, ImageDraw
 
+# ═══════════════════════════════════════════════
+# 常量
+# ═══════════════════════════════════════════════
+MAX_LOG_LINES = 500        # 日志最大行数
+MAX_RETRIES = 3            # 网络失败重试次数
+RETRY_DELAY = 5            # 重试间隔(秒)
+PROGRESS_INTERVAL = 50     # 每处理N个文件汇报一次进度
+
 class PathPoolCopyApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("产线测试数据自动汇总客户端 v9.2")
+        self.root.title("产线测试数据自动汇总客户端 v10.1")
         self.root.geometry("720x680")
         self.root.resizable(False, False)
-        
-        # ==================== 【核心修复区】 ====================
-        # 判断当前是直接运行 .py 源码，还是运行打包后的 .exe
+
+        # DPI 感知（Windows 高分屏）
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+        # 判断源码 / exe 运行
         if getattr(sys, 'frozen', False):
-            # 如果是打包后的 exe，获取 exe 所在的真实物理目录
             application_path = os.path.dirname(sys.executable)
         else:
-            # 如果是源码运行，获取 py 文件所在目录
             application_path = os.path.dirname(os.path.abspath(__file__))
-            
-        # 将 ini 配置文件强制保存在 exe 的同级目录下
+
         self.config_file = os.path.join(application_path, "config.ini")
-        # ========================================================
-        
         self.config = configparser.ConfigParser()
-        
-        self.line_var = tk.StringVar(value="线体名称")
-        self.station_var = tk.StringVar(value="站位名称")
-        self.device_var = tk.StringVar(value="电脑名称")
+
+        self.line_var = tk.StringVar(value="Line_1")
+        self.station_var = tk.StringVar(value="AT")
+        self.device_var = tk.StringVar(value="AT_01")
         self.source_var = tk.StringVar()
         self.target_var = tk.StringVar()
         self.target_hour = tk.StringVar(value="16")
         self.target_minute = tk.StringVar(value="30")
-        
+
         self.is_running = False
         self.path_pool = []
-        
+
         self.load_config()
         self.create_widgets()
         self.refresh_pool_listbox()
-        
+
         self.root.protocol('WM_DELETE_WINDOW', self.minimize_to_tray)
-        
+
+    # ═══════════════════════════════════════════════
+    # 配置持久化
+    # ═══════════════════════════════════════════════
     def load_config(self):
         if os.path.exists(self.config_file):
             try:
@@ -59,7 +80,7 @@ class PathPoolCopyApp:
                 self.device_var.set(self.config.get("STATION_INFO", "device_id", fallback="AT_01"))
                 self.target_hour.set(self.config.get("TIMER_CONFIG", "hour", fallback="16"))
                 self.target_minute.set(self.config.get("TIMER_CONFIG", "minute", fallback="30"))
-                
+
                 pool_json = self.config.get("PATH_CONFIG", "pool_data", fallback="[]")
                 self.path_pool = json.loads(pool_json)
             except Exception:
@@ -69,14 +90,14 @@ class PathPoolCopyApp:
         if "STATION_INFO" not in self.config: self.config["STATION_INFO"] = {}
         if "PATH_CONFIG" not in self.config: self.config["PATH_CONFIG"] = {}
         if "TIMER_CONFIG" not in self.config: self.config["TIMER_CONFIG"] = {}
-            
+
         self.config["STATION_INFO"]["line_id"] = self.line_var.get().strip()
         self.config["STATION_INFO"]["station_type"] = self.station_var.get().strip()
         self.config["STATION_INFO"]["device_id"] = self.device_var.get().strip()
         self.config["TIMER_CONFIG"]["hour"] = self.target_hour.get().strip()
         self.config["TIMER_CONFIG"]["minute"] = self.target_minute.get().strip()
         self.config["PATH_CONFIG"]["pool_data"] = json.dumps(self.path_pool)
-        
+
         try:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 self.config.write(f)
@@ -85,6 +106,9 @@ class PathPoolCopyApp:
             messagebox.showerror("错误", f"保存配置文件失败: {str(e)}")
             return False
 
+    # ═══════════════════════════════════════════════
+    # 路径操作
+    # ═══════════════════════════════════════════════
     def select_source(self):
         path = filedialog.askdirectory(title="选择本地测试数据源文件夹")
         if path: self.source_var.set(path.replace('\\', '/'))
@@ -127,24 +151,34 @@ class PathPoolCopyApp:
         for i, item in enumerate(self.path_pool, 1):
             self.pool_listbox.insert(tk.END, f"[{i}] 源: {item['src']}  ➔  目的: {item['dst']}")
 
+    # ═══════════════════════════════════════════════
+    # 日志（带行数限制）
+    # ═══════════════════════════════════════════════
     def log_message(self, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         def append():
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            # 限制最大行数
+            lines = int(self.log_text.index('end-1c').split('.')[0])
+            if lines > MAX_LOG_LINES:
+                self.log_text.delete('1.0', f'{lines - MAX_LOG_LINES}.0')
             self.log_text.see(tk.END)
         self.root.after(0, append)
 
+    # ═══════════════════════════════════════════════
+    # 定时器（宽窗口防踩空）
+    # ═══════════════════════════════════════════════
     def toggle_timer(self):
         if not self.is_running:
             if not self.path_pool:
                 messagebox.showwarning("警告", "当前路径池为空！请先添加地址串。")
                 return
             if not self.save_config(): return
-            
+
             self.is_running = True
             self.start_btn.config(text="⏹️ 停止自动运行", bg="#dc2626")
-            self.log_message(f"【定时器】守护启动！每日 {self.target_hour.get()}:{self.target_minute.get()} 自动提取当天增量数据传输。")
-            
+            self.log_message(f"【定时器】守护启动！每日 {self.target_hour.get()}:{self.target_minute.get()} 自动提取并合并当天增量数据。")
+
             self.timer_thread = threading.Thread(target=self.backend_timer_worker, daemon=True)
             self.timer_thread.start()
             self.root.after(1200, self.minimize_to_tray)
@@ -158,72 +192,158 @@ class PathPoolCopyApp:
         while self.is_running:
             now = datetime.now()
             current_date = now.strftime("%Y-%m-%d")
-            current_time = now.strftime("%H:%M")
-            target_time_str = f"{int(self.target_hour.get()):02d}:{int(self.target_minute.get()):02d}"
-            
-            if current_time == target_time_str and last_executed_date != current_date:
-                self.log_message("【触发】时间已到！开始过滤并提取今日新增数据...")
+            current_h = now.hour
+            current_m = now.minute
+            target_h = int(self.target_hour.get())
+            target_m = int(self.target_minute.get())
+
+            # 宽窗口：目标分钟 ±1 分钟内都触发，防止 sleep 踩空
+            in_window = (
+                current_h == target_h and abs(current_m - target_m) <= 1
+            )
+
+            if in_window and last_executed_date != current_date:
+                self.log_message("【触发】时间已到！开始执行今日数据提取与增量合并...")
                 self.execute_pool_copy_logic()
                 last_executed_date = current_date
-            time.sleep(2)
+
+            # 接近目标时间时缩短轮询间隔，远离时放长
+            near_target = (current_h == target_h and abs(current_m - target_m) <= 5)
+            time.sleep(10 if near_target else 45)
 
     def manual_sync(self):
         if not self.path_pool:
             messagebox.showwarning("警告", "池子为空，没有可同步的数据！")
             return
-        if messagebox.askyesno("手动同步", "是否立即提取并同步一次【当天产生】的增量数据？\n(往期旧数据将被自动忽略)"):
+        if messagebox.askyesno("手动同步", "是否立即执行一次智能合并同步？\n\n(将递归提取今天变动的文件，若服务器已存在旧文件则对比大小后覆盖更新)"):
             threading.Thread(target=self.execute_pool_copy_logic, daemon=True).start()
 
+    # ═══════════════════════════════════════════════
+    # 核心：智能递归合并引擎
+    # ═══════════════════════════════════════════════
+    def smart_incremental_sync(self, src, dst, today_date, progress_cb=None):
+        """
+        深层递归引擎：
+        1. 穿透所有子文件夹
+        2. 只拿今天修改过的文件
+        3. 对比服务器文件大小，有变化才覆盖，无变化跳过省带宽
+        4. 单个文件异常不中断整个任务
+        """
+        copied_files = 0
+        skipped_files = 0
+        error_files = 0
+
+        try:
+            if os.path.isfile(src):
+                mtime = os.path.getmtime(src)
+                if datetime.fromtimestamp(mtime).date() == today_date:
+                    need_copy = True
+
+                    if os.path.exists(dst):
+                        try:
+                            if os.path.getsize(src) == os.path.getsize(dst):
+                                need_copy = False
+                        except OSError:
+                            pass  # 目标文件读取失败，当作需要更新
+
+                    if need_copy:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(src, dst)
+                        copied_files += 1
+                    else:
+                        skipped_files += 1
+                else:
+                    skipped_files += 1
+
+            elif os.path.isdir(src):
+                try:
+                    entries = os.listdir(src)
+                except PermissionError:
+                    self.log_message(f"【警告】无权限访问 {src}，跳过")
+                    return 0, 0, 1
+
+                for item in entries:
+                    s_item = os.path.join(src, item)
+                    d_item = os.path.join(dst, item)
+                    c, s, e = self.smart_incremental_sync(s_item, d_item, today_date, progress_cb)
+                    copied_files += c
+                    skipped_files += s
+                    error_files += e
+
+                    if progress_cb and (copied_files + skipped_files) % PROGRESS_INTERVAL == 0:
+                        progress_cb(copied_files, skipped_files)
+
+        except Exception as e:
+            self.log_message(f"【警告】处理 {src} 时出错: {e}")
+            error_files += 1
+
+        return copied_files, skipped_files, error_files
+
+    # ═══════════════════════════════════════════════
+    # 执行池任务（带重试）
+    # ═══════════════════════════════════════════════
     def execute_pool_copy_logic(self):
         line = self.line_var.get().strip()
         station = self.station_var.get().strip()
         device = self.device_var.get().strip()
-        
+
         now = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
         today_date = now.date()
-        
+
+        total_copied = 0
+        total_skipped = 0
+        total_errors = 0
+
         for index, item in enumerate(self.path_pool, 1):
             src = item["src"]
             dst_base = item["dst"]
-            
+
             self.log_message(f"【进度 {index}/{len(self.path_pool)}】扫描源: {src}")
             if not os.path.exists(src):
                 self.log_message("【错误】源路径不存在，自动跳过。")
                 continue
-                
-            try:
-                folder_name = os.path.basename(src) if os.path.basename(src) else f"Log_Pool_{index}"
-                final_server_dir = os.path.join(dst_base, date_str, line, station, device, folder_name).replace('\\', '/')
-                os.makedirs(final_server_dir, exist_ok=True)
-                
-                copied_count = 0
-                skipped_old_count = 0
-                
-                for file_or_dir in os.listdir(src):
-                    item_path = os.path.join(src, file_or_dir)
-                    
-                    mtime = os.path.getmtime(item_path)
-                    item_date = datetime.fromtimestamp(mtime).date()
-                    
-                    if item_date != today_date:
-                        skipped_old_count += 1
-                        continue
-                    
-                    target_item_path = os.path.join(final_server_dir, file_or_dir).replace('\\', '/')
-                    if os.path.exists(target_item_path): continue
-                    
-                    if os.path.isdir(item_path):
-                        shutil.copytree(item_path, target_item_path)
-                    elif os.path.isfile(item_path):
-                        shutil.copy2(item_path, target_item_path)
-                    copied_count += 1
-                        
-                self.log_message(f"【成功】池任务 {index} 完成。提取当日新数据 {copied_count} 项，忽略旧数据 {skipped_old_count} 项。")
-            except Exception as e:
-                self.log_message(f"【异常】池任务 {index} 中断: {str(e)}")
-        self.log_message("【大功告成】当前池内所有数据的【当日增量】提取与汇总全部结束！")
 
+            # 带重试的网络同步
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    folder_name = os.path.basename(src) if os.path.basename(src) else f"Log_Pool_{index}"
+                    final_server_dir = os.path.join(dst_base, date_str, line, station, device, folder_name).replace('\\', '/')
+
+                    def progress_cb(copied, skipped):
+                        self.log_message(f"  ↳ 已处理 {copied + skipped} 个文件...")
+
+                    copied_count, skipped_count, error_count = self.smart_incremental_sync(
+                        src, final_server_dir, today_date, progress_cb
+                    )
+
+                    status = "✅" if error_count == 0 else "⚠️"
+                    self.log_message(
+                        f"【{status}】池任务 {index} 完成。"
+                        f"新增/更新 {copied_count} 个，跳过(无变化/旧文件) {skipped_count} 个"
+                        + (f"，异常 {error_count} 个" if error_count else "")
+                    )
+                    total_copied += copied_count
+                    total_skipped += skipped_count
+                    total_errors += error_count
+                    break  # 成功，跳出重试循环
+
+                except Exception as e:
+                    if attempt < MAX_RETRIES:
+                        self.log_message(f"【重试 {attempt}/{MAX_RETRIES}】失败: {e}，{RETRY_DELAY}秒后重试...")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        self.log_message(f"【放弃】池任务 {index} 重试 {MAX_RETRIES} 次后仍失败: {e}")
+                        total_errors += 1
+
+        summary = f"【大功告成】同步结束！更新 {total_copied} / 跳过 {total_skipped}"
+        if total_errors:
+            summary += f" / 异常 {total_errors}"
+        self.log_message(summary)
+
+    # ═══════════════════════════════════════════════
+    # 系统托盘
+    # ═══════════════════════════════════════════════
     def create_tray_image(self):
         image = Image.new('RGB', (64, 64), color=(30, 41, 59))
         draw = ImageDraw.Draw(image)
@@ -236,7 +356,7 @@ class PathPoolCopyApp:
             pystray.MenuItem("▶ 显示主配置界面", self.restore_from_tray, default=True),
             pystray.MenuItem("🛑 完全退出程序", self.quit_app)
         )
-        self.tray_icon = pystray.Icon("DataSync", self.create_tray_image(), "产线数据增量汇总 (挂机中)", menu)
+        self.tray_icon = pystray.Icon("DataSync", self.create_tray_image(), "产线数据增量合并 (挂机中)", menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def restore_from_tray(self, icon, item):
@@ -249,19 +369,22 @@ class PathPoolCopyApp:
         self.root.after(0, self.root.destroy)
         os._exit(0)
 
+    # ═══════════════════════════════════════════════
+    # GUI
+    # ═══════════════════════════════════════════════
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="15")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         config_frame = ttk.LabelFrame(main_frame, text=" 1. 基本机台信息与定时设置 ", padding="10")
         config_frame.pack(fill=tk.X, side=tk.TOP, pady=5)
         ttk.Label(config_frame, text="所属线别:").grid(row=0, column=0, sticky=tk.W, padx=2, pady=5)
-        ttk.Combobox(config_frame, textvariable=self.line_var, values=["A01", "P01", "A02","P02", "A03","P03", "A04","P04", "A05","P05", "A06","P06", "A07","P07"], width=8).grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        ttk.Combobox(config_frame, textvariable=self.line_var, values=["Line_1", "Line_2", "Line_3"], width=8).grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
         ttk.Label(config_frame, text="所属站别:").grid(row=0, column=2, sticky=tk.W, padx=10, pady=5)
-        ttk.Combobox(config_frame, textvariable=self.station_var, values=["PT","CAT","AT","MT","RSE","CW","MC"], width=8).grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
+        ttk.Combobox(config_frame, textvariable=self.station_var, values=["AT", "FT", "QA"], width=8).grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
         ttk.Label(config_frame, text="机台编号:").grid(row=0, column=4, sticky=tk.W, padx=10, pady=5)
         ttk.Entry(config_frame, textvariable=self.device_var, width=12).grid(row=0, column=5, sticky=tk.W, padx=5, pady=5)
-        
+
         ttk.Label(config_frame, text="每日触发时间:").grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=2, pady=5)
         time_sub_frame = ttk.Frame(config_frame)
         time_sub_frame.grid(row=1, column=2, columnspan=4, sticky=tk.W, pady=5)
@@ -269,7 +392,7 @@ class PathPoolCopyApp:
         ttk.Label(time_sub_frame, text="时").pack(side=tk.LEFT, padx=2)
         ttk.Combobox(time_sub_frame, textvariable=self.target_minute, values=[f"{i:02d}" for i in range(60)], width=4).pack(side=tk.LEFT)
         ttk.Label(time_sub_frame, text="分").pack(side=tk.LEFT, padx=2)
-        
+
         path_frame = ttk.LabelFrame(main_frame, text=" 2. 路径添加操作区 ", padding="10")
         path_frame.pack(fill=tk.X, pady=5)
         ttk.Label(path_frame, text="本地源路径:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
@@ -278,12 +401,12 @@ class PathPoolCopyApp:
         ttk.Label(path_frame, text="服务器目的:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         ttk.Entry(path_frame, textvariable=self.target_var, width=54).grid(row=1, column=1, padx=5, pady=5)
         ttk.Button(path_frame, text="浏览...", command=self.select_target, width=8).grid(row=1, column=2, padx=5, pady=5)
-        
+
         action_btn_frame = ttk.Frame(path_frame)
         action_btn_frame.grid(row=2, column=1, columnspan=2, sticky=tk.E, pady=5)
         ttk.Button(action_btn_frame, text="❌ 从池子中删除", command=self.remove_from_pool, width=18).pack(side=tk.RIGHT, padx=5)
         ttk.Button(action_btn_frame, text="➕ 添加入待传路径池", command=self.add_to_pool, width=18).pack(side=tk.RIGHT, padx=5)
-        
+
         pool_frame = ttk.LabelFrame(main_frame, text=" 3. 待传路径池 (当前任务清单) ", padding="10")
         pool_frame.pack(fill=tk.X, pady=5)
         self.pool_listbox = tk.Listbox(pool_frame, height=4, font=("Consolas", 9), selectmode=tk.SINGLE)
@@ -291,7 +414,7 @@ class PathPoolCopyApp:
         scroll_y = ttk.Scrollbar(pool_frame, command=self.pool_listbox.yview)
         scroll_y.pack(fill=tk.Y, side=tk.RIGHT)
         self.pool_listbox.config(yscrollcommand=scroll_y.set)
-        
+
         log_frame = ttk.LabelFrame(main_frame, text=" 4. 运行状态日志 ", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         self.log_text = tk.Text(log_frame, height=6, bg="#ffffff", font=("Consolas", 9))
@@ -299,11 +422,11 @@ class PathPoolCopyApp:
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
         self.log_text.config(yscrollcommand=scrollbar.set)
-        
+
         btn_frame = ttk.Frame(main_frame, padding="5")
         btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
-        tk.Button(btn_frame, text="⚡ 仅同步今日数据 (测试)", command=self.manual_sync, bg="#0284c7", fg="white", font=("微软雅黑", 11, "bold"), width=22).pack(side=tk.LEFT, padx=5, ipady=5)
-        self.start_btn = tk.Button(btn_frame, text="▶️ 开始后台自动运行", command=self.toggle_timer, bg="#16a34a", fg="white", font=("微软雅黑", 11, "bold"), width=26)
+        tk.Button(btn_frame, text="⚡ 仅同步今日数据 (手动合并)", command=self.manual_sync, bg="#0284c7", fg="white", font=("微软雅黑", 11, "bold"), width=24).pack(side=tk.LEFT, padx=5, ipady=5)
+        self.start_btn = tk.Button(btn_frame, text="▶️ 开始后台自动运行", command=self.toggle_timer, bg="#16a34a", fg="white", font=("微软雅黑", 11, "bold"), width=24)
         self.start_btn.pack(side=tk.RIGHT, padx=5, ipady=5)
 
 if __name__ == "__main__":
