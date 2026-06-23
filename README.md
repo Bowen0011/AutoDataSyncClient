@@ -61,3 +61,25 @@ pyinstaller --onefile --windowed --name "DataSyncClient" TestLogSyncClient.py
 ## 📝 License
 
 MIT © 2026
+
+## 🆕 v10.2 — Trigger 远程触发支持
+
+配合 [LineDataMaster](https://github.com/Bowen0011/LineDataMaster) 主控面板使用：
+
+1. 启动后自动监控服务器 `trigger/line_{线别}/{站别}_cmd.json`
+2. 检测到触发指令 → 立即执行同步
+3. 完成后写 `_done.json` 标记，主控面板感知后自动触发分析
+
+### Trigger 格式
+
+```json
+{
+  "action": "sync_now",
+  "line": "A03",
+  "station_type": "AT",
+  "target_root": "//server/data",
+  "source_paths": [
+    {"src": "D:/TestLog/AT01/TC661", "dst_sub": "AT01"}
+  ]
+}
+```
